@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Listen for Kimi pod announcements on ntfy and act on them (runs as a systemd user service).
+
+  up POD IP PORT SECS -> kimi-pod up (tunnel), answer every queued question in
+                         ~/.config/kimi-pod/pending/, tell the asking tmux session via q
+  down POD REASON     -> kimi-pod down
+
+A pending question is a JSON file {"session": "<tmux session or empty>", "question": "..."};
+its answer lands in ~/.config/kimi-pod/answers/<same name>.md.
+"""
+import json, os, subprocess, time, urllib.request
+from pathlib import Path
+
+CFG = Path.home() / ".config/kimi-pod"
+PENDING, ANSWERS = CFG / "pending", CFG / "answers"
+TOPIC = (CFG / "ntfy_topic").read_text().strip()
+TOKEN = (CFG / "ntfy_listen_token").read_text().strip()
+BIN = Path.home() / "bin"
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def tell(session, text):
+    cmd = ["q", "-s", session, text] if session else ["q", text]
+    subprocess.run(cmd, cwd=Path.home() / "envs/private/diverse", check=False)
+
+
+def answer_pending():
+    ANSWERS.mkdir(exist_ok=True)
+    for f in sorted(PENDING.glob("*.json")):
+        job = json.loads(f.read_text())
+        log("asking", f.name)
+        r = subprocess.run([BIN / "kimi"], input=job["question"], capture_output=True, text=True)
+        if r.returncode != 0:
+            # Leave the pending file so a real pod can still answer it later; don't burn it on a
+            # failed call (e.g. tunnel to a dead host from a stale announcement).
+            log("kimi failed, keeping pending", f.name, r.stderr.strip().splitlines()[-1:])
+            continue
+        out = ANSWERS / (f.stem + ".md")
+        out.write_text(r.stdout)
+        f.unlink()
+        tell(job.get("session", ""), f"Kimi har svarat: {out}")
+
+
+def handle(msg, age):
+    parts = msg.split()
+    # ntfy can redeliver cached messages on reconnect; a stale "up" points at a dead pod and
+    # would consume a pending question. Only act on fresh announcements.
+    if age > 180:
+        log("ignoring stale message", int(age), "s:", msg[:60])
+        return
+    if parts[:1] == ["up"] and len(parts) >= 4:
+        _, pod, host, port, *rest = parts
+        log("pod up", pod, host, port, *rest)
+        subprocess.run([BIN / "kimi-pod", "up", pod, host, port], check=False)
+        for _ in range(12):  # tunnel needs a few seconds
+            try:
+                urllib.request.urlopen("http://127.0.0.1:18093/health", timeout=5)
+                break
+            except OSError:
+                time.sleep(5)
+        PENDING.mkdir(exist_ok=True)
+        answer_pending()
+        # one-shot: launch an interactive Claude Code session against Kimi if requested
+        flag = CFG / "launch_session"
+        if flag.exists():
+            log("launching tmux kimi-session")
+            subprocess.run([BIN / "kimi-session"], check=False)
+            flag.unlink()
+            tell("", "Kimi-session redo: tmux attach -t kimi")
+    elif parts[:1] == ["down"]:
+        log("pod down:", msg)
+        subprocess.run([BIN / "kimi-pod", "down"], check=False)
+
+
+def main():
+    since = str(int(time.time()))
+    while True:
+        try:
+            req = urllib.request.Request(
+                f"https://{os.environ.get('NTFY_HOST','ntfy.sh')}/{TOPIC}/json?since={since}",
+                # Cloudflare in front of ntfy 403s urllib's default User-Agent
+                headers={"Authorization": f"Bearer {TOKEN}", "User-Agent": "kimi-pod-listen/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for line in r:
+                    ev = json.loads(line)
+                    since = ev.get("id", since)
+                    if ev.get("event") == "message":
+                        handle(ev.get("message", ""), time.time() - ev.get("time", 0))
+        except Exception as e:  # stream drops and timeouts: reconnect where we left off
+            if not isinstance(e, TimeoutError):
+                log("reconnect:", e)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+# Per-user secrets and state — create these yourself, never commit them.
+# See README.md "Setup".
+api_key
+ntfy_topic
+ntfy_pod_token
+ntfy_listen_token
+url
+state
+launch_session
+pending/
+answers/
+id_runpod
+id_runpod.pub

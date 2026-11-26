@@ -1,0 +1,116 @@
+#!/bin/bash
+# Local side of the kimi-expert skill: SSH tunnel + state + idle check for the Kimi-K3 pod.
+# Pod create/terminate goes through the Runpod MCP (see ~/.claude/skills/kimi-expert/SKILL.md).
+#
+#   kimi-pod up POD_ID HOST PORT   save state, (re)start tunnel 127.0.0.1:18093 -> pod 127.0.0.1:8080
+#   kimi-pod status                pod id, tunnel, /health, minutes since the server last logged
+#   kimi-pod idle                  minutes since the server log last changed (for the idle stop)
+#   kimi-pod down                  stop the tunnel and forget the pod
+#   kimi-pod body [QUEUE_HOURS]    print the create-pod body (with queue if QUEUE_HOURS given)
+#                                  GPU override: KIMI_GPU_ID / KIMI_GPU_COUNT env vars
+#   kimi-pod ask "QUESTION"        park a question for kimi-pod-listen to send once a pod is up
+set -u
+CFG=~/.config/kimi-pod
+STATE=$CFG/state
+KEY=~/.ssh/id_runpod
+UNIT=kimi-pod-tunnel
+LOCAL=18093
+
+load() { [ -f "$STATE" ] && . "$STATE"; }
+pod_ssh() { ssh -i "$KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -p "$PORT" "root@$HOST" "$@"; }
+
+case "${1:-status}" in
+  up)
+    [ $# -eq 4 ] || { echo "usage: kimi-pod up POD_ID HOST PORT" >&2; exit 2; }
+    printf 'POD=%s\nHOST=%s\nPORT=%s\nSINCE=%s\n' "$2" "$3" "$4" "$(date +%s)" > "$STATE"
+    echo "http://127.0.0.1:$LOCAL" > "$CFG/url"
+    systemctl --user stop "$UNIT" 2>/dev/null; systemctl --user reset-failed "$UNIT" 2>/dev/null
+    # A new pod reuses IPs with new host keys; don't let a stale known_hosts entry block the tunnel
+    ssh-keygen -R "[$3]:$4" >/dev/null 2>&1
+    systemd-run --user --unit="$UNIT" -p Restart=always -p RestartSec=5 \
+      ssh -i "$KEY" -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      -o StrictHostKeyChecking=accept-new -p "$4" -L "127.0.0.1:$LOCAL:127.0.0.1:8080" "root@$3" >/dev/null
+    sleep 3; systemctl --user is-active "$UNIT"
+    ;;
+  status)
+    load || { echo "no pod"; exit 1; }
+    echo "pod $POD ($HOST:$PORT), up $(( ($(date +%s) - SINCE) / 60 )) min"
+    echo "tunnel: $(systemctl --user is-active $UNIT)"
+    echo "health: $(curl -s -m 5 http://127.0.0.1:$LOCAL/health || echo unreachable)"
+    echo "idle: $("$0" idle) min"
+    ;;
+  idle)
+    load || { echo "no pod" >&2; exit 1; }
+    # llama-server logs every request; a quiet log means a quiet server
+    m=$(pod_ssh 'stat -c %Y /tmp/server.log 2>/dev/null || echo 0') || exit 1
+    echo $(( ($(date +%s) - m) / 60 ))
+    ;;
+  down)
+    systemctl --user stop "$UNIT" 2>/dev/null
+    rm -f "$STATE"
+    echo "tunnel stopped, state cleared"
+    ;;
+  body)
+    # kimi-pod body [QUEUE_HOURS] [cold]
+    #   cold (default): no volume, 700 GB container disk, any DC — coldboot.sh downloads+builds
+    #   warm:           network volume fumj120f26 on /vol (CA-MTL-3 only) — boot.sh prewarms
+    # The boot script travels in the env (base64) so a queued pod runs the current version wherever
+    # it lands.
+    # GPU: defaults to 7x RTX PRO 6000 (672 GB). Set KIMI_GPU_ID / KIMI_GPU_COUNT to land on
+    # another card when RTX PRO is out of stock (SKILL.md has the priority list). coldboot.sh
+    # detects the card's compute arch and builds for it, so any CUDA card works; keep total
+    # VRAM >= 672 GB or lower KIMI_CTX to fit a smaller rig.
+    python3 - "${2:-}" "${3:-cold}" <<'EOF'
+import base64, datetime, json, os, sys
+hours, mode = sys.argv[1], sys.argv[2]
+c = os.path.expanduser("~/.config/kimi-pod/")
+r = lambda f: open(c + f).read().strip()
+cold = mode != "warm"
+gpu_id = os.environ.get("KIMI_GPU_ID", "NVIDIA RTX PRO 6000 Blackwell Server Edition")
+gpu_count = int(os.environ.get("KIMI_GPU_COUNT", "7"))
+env = {
+    "LLAMA_API_KEY": r("api_key"),
+    "PUBLIC_KEY": open(os.path.expanduser("~/.ssh/id_runpod.pub")).read().strip(),
+    "NTFY_TOPIC": r("ntfy_topic"),
+    "NTFY_TOKEN": r("ntfy_pod_token"),
+    "KIMI_BOOT": base64.b64encode(open(c + ("coldboot.sh" if cold else "boot.sh"), "rb").read()).decode(),
+}
+# pass overrides through to the boot script: KIMI_CTX shrinks KV for a <672 GB rig,
+# KIMI_ARCH pins the CUDA build archs (default builds a fat 80;90;100;120 binary)
+for k in ("KIMI_CTX", "KIMI_ARCH", "KIMI_NP"):
+    if os.environ.get(k):
+        env[k] = os.environ[k]
+body = {
+    "name": "kimi-expert",
+    "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
+    "cloud": "SECURE",
+    "gpu": {"id": gpu_id, "count": gpu_count, "minCudaVersion": "12.8"},
+    "disk": 700 if cold else 20,
+    "ports": ["22/tcp"],
+    "env": env,
+    # keep the image's own /start.sh (sshd) as the main process; boot runs beside it
+    "args": json.dumps({"cmd": ["bash", "-c",
+        'echo "$KIMI_BOOT" | base64 -d > /tmp/boot.sh; (bash /tmp/boot.sh > /tmp/boot.log 2>&1 &); exec /start.sh']}),
+}
+if not cold:  # the volume lives in CA-MTL-3, so a warm pod must land there
+    body["dataCenterIds"] = ["CA-MTL-3"]
+    body["mounts"] = {"network": [{"volumeId": "fumj120f26", "path": "/vol"}]}
+# cold: no dataCenterIds -> any DC with the card; no mounts
+if sys.argv[1]:
+    end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=float(sys.argv[1]))
+    body["queue"] = {"expiresAt": end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if os.environ.get("KIMI_NOTIFY_EMAIL"):  # optional Runpod queue notification
+        body["queue"]["notifyEmail"] = os.environ["KIMI_NOTIFY_EMAIL"]
+print(json.dumps(body))
+EOF
+    ;;
+  ask)
+    [ $# -eq 2 ] || { echo 'usage: kimi-pod ask "QUESTION"' >&2; exit 2; }
+    mkdir -p "$CFG/pending"
+    f="$CFG/pending/$(date +%Y%m%d-%H%M%S).json"
+    python3 -c 'import json,sys; print(json.dumps({"session": sys.argv[1], "question": sys.argv[2]}))' \
+      "$(tmux display-message -p '#S' 2>/dev/null)" "$2" > "$f"
+    echo "$f"
+    ;;
+  *) sed -n '2,10p' "$0"; exit 2 ;;
+esac
